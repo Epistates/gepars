@@ -1,0 +1,52 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Editor temporaries
+*.swp
+*.swo
+*~
+.#*
+\#*#
+
+# JetBrains / IntelliJ
+.idea/
+*.iml
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Generated documentation
+doc/
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Profiling
+flamegraph.svg
+perf.data
+
+# Run artefacts produced by GEPA examples
+gepa_result.json
+code_gen_result.json
+runs/
+
+*.md
+!README.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!CHANGELOG.md
+!SECURITY.md

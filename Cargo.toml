@@ -1,0 +1,74 @@
+[package]
+name = "gepa"
+version = "0.1.0"
+edition = "2024"
+description = "GEPA: Reflective Prompt Evolution — a Rust implementation of the genetic-Pareto prompt optimizer"
+license = "MIT"
+repository = "https://github.com/nicholasjpaterno/gepa"
+keywords = ["llm", "prompt-optimization", "genetic-algorithm", "pareto", "ai"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP & LLM
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Hashing (evaluation cache)
+sha2 = "0.10"
+
+# Ordered maps
+indexmap = { version = "2", features = ["serde"] }
+
+# Random
+rand = "0.8"
+
+# Async traits
+async-trait = "0.1"
+
+# Progress
+indicatif = "0.17"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+
+[features]
+# Optional experiment-tracking back-ends (stubs only — full integration TBD).
+wandb = []
+mlflow = []
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+doc_markdown = "allow"
+doc_overindented_list_items = "allow"
+implicit_hasher = "allow"
+cast_precision_loss = "allow"
+float_cmp = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+needless_pass_by_value = "allow"
+items_after_statements = "allow"
+type_complexity = "allow"
+struct_excessive_bools = "allow"
+empty_line_after_doc_comments = "allow"
+missing_errors_doc = "allow"
