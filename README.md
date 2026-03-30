@@ -277,8 +277,9 @@ OPENAI_API_KEY=sk-... cargo run --example quickstart -- --live
 ## References
 
 - Paper: [GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning](https://arxiv.org/pdf/2507.19457) (ICLR 2026 Oral)
-- Python reference implementation: [gepa-py](https://github.com/nicholasjpaterno/gepa-py)
+- Python reference implementation: [gepa-py](https://github.com/epistates/gepa)
 - API documentation: [docs.rs/gepa](https://docs.rs/gepa)
+- Original GEPA repo: https://github.com/gepa-ai/gepa
 
 ## License
 
