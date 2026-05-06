@@ -64,7 +64,7 @@ pub struct GEPAResult<Id: DataId> {
     )]
     pub per_val_instance_best_candidates: HashMap<Id, HashSet<ProgramIdx>>,
 
-    /// Number of adapter `evaluate()` calls consumed to discover each candidate.
+    /// Number of per-example metric evaluations consumed to discover each candidate.
     pub discovery_eval_counts: Vec<usize>,
 
     // ---- Optional multi-objective data -----------------------------------
@@ -80,7 +80,7 @@ pub struct GEPAResult<Id: DataId> {
     pub objective_pareto_front: Option<HashMap<String, f64>>,
 
     // ---- Run metadata ----------------------------------------------------
-    /// Total number of adapter `evaluate()` calls consumed by the full run.
+    /// Total number of per-example metric evaluations consumed by the full run.
     pub total_metric_calls: Option<usize>,
 
     /// Number of full validation-set evaluations performed.

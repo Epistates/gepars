@@ -40,6 +40,60 @@ task, if so, include that in the instruction as well.
 
 Provide the new instructions within ``` blocks.";
 
+/// Meta-prompt template for **code** components.
+///
+/// Used when `ComponentKind::Code` is set for the component being mutated.
+/// Focuses on targeted code edits, preserving working patterns, and
+/// understanding error traces.
+pub const CODE_META_PROMPT_TEMPLATE: &str = "\
+I have a program with the following code for the <component_name> component:
+```<language>
+<curr_param>
+```
+
+The following are results from running this code, including metrics and any errors:
+```
+<side_info>
+```
+
+Your task is to propose an improved version of this code.
+
+Analyze the metrics and error traces carefully. Identify:
+1. What is working well (preserve these patterns)
+2. What is underperforming or failing (target these for improvement)
+3. Any numerical instabilities, resource constraints, or performance bottlenecks
+
+Make targeted changes rather than rewriting from scratch. Explain your reasoning \
+briefly, then provide the complete improved code within ``` blocks.";
+
+/// Meta-prompt template for **config** components.
+///
+/// Used when `ComponentKind::Config` is set for the component being mutated.
+/// Focuses on hyperparameter tuning with awareness of constraints and
+/// prior results.
+pub const CONFIG_META_PROMPT_TEMPLATE: &str = "\
+I have a system configured with the following parameters:
+```
+<curr_param>
+```
+
+<constraints>
+
+The following are results from running with this configuration:
+```
+<side_info>
+```
+
+Your task is to propose an improved configuration.
+
+Analyze the metrics carefully. Consider:
+1. Which parameters most likely influence the observed metrics
+2. Whether to make small incremental changes or larger exploratory jumps
+3. The trade-offs between different objectives (if multiple metrics shown)
+
+Provide the complete improved configuration within ``` blocks. \
+Change only the values, not the format or parameter names.";
+
 // ---------------------------------------------------------------------------
 // Prompt rendering
 // ---------------------------------------------------------------------------
@@ -54,6 +108,42 @@ pub fn render_prompt(current_instruction: &str, reflective_dataset: &str) -> Str
     META_PROMPT_TEMPLATE
         .replace("<curr_param>", current_instruction)
         .replace("<side_info>", reflective_dataset)
+}
+
+/// Render the code-mutation meta-prompt.
+///
+/// Replaces `<curr_param>`, `<side_info>`, `<component_name>`, and `<language>`
+/// in [`CODE_META_PROMPT_TEMPLATE`].
+pub fn render_code_prompt(
+    current_code: &str,
+    reflective_dataset: &str,
+    component_name: &str,
+    language: &str,
+) -> String {
+    CODE_META_PROMPT_TEMPLATE
+        .replace("<curr_param>", current_code)
+        .replace("<side_info>", reflective_dataset)
+        .replace("<component_name>", component_name)
+        .replace("<language>", language)
+}
+
+/// Render the config-mutation meta-prompt.
+///
+/// Replaces `<curr_param>`, `<side_info>`, and `<constraints>` in
+/// [`CONFIG_META_PROMPT_TEMPLATE`].
+pub fn render_config_prompt(
+    current_config: &str,
+    reflective_dataset: &str,
+    constraints: Option<&str>,
+) -> String {
+    let constraints_block = match constraints {
+        Some(c) => format!("Parameter constraints:\n{c}\n"),
+        None => String::new(),
+    };
+    CONFIG_META_PROMPT_TEMPLATE
+        .replace("<curr_param>", current_config)
+        .replace("<side_info>", reflective_dataset)
+        .replace("<constraints>", &constraints_block)
 }
 
 /// Render using a custom template.

@@ -57,6 +57,10 @@ pub enum GEPAError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// A built-in adapter (e.g., [`ProcessAdapter`]) encountered an error.
+    #[error("Adapter error: {0}")]
+    AdapterError(String),
+
     /// Transparent wrapper around [`std::io::Error`].
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

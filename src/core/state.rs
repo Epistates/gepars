@@ -322,7 +322,7 @@ pub struct GEPAState<Id: DataId> {
     /// Per-candidate aggregated objective scores (averaged over val set).
     pub prog_candidate_objective_scores: Vec<ObjectiveScores>,
 
-    /// Number of `evaluate()` calls consumed to discover each candidate.
+    /// Number of per-example metric evaluations consumed to discover each candidate.
     pub num_metric_calls_by_discovery: Vec<usize>,
 
     // ---- Instance-level Pareto front ------------------------------------
@@ -376,11 +376,10 @@ pub struct GEPAState<Id: DataId> {
     /// Total number of full validation-set evaluations performed.
     pub num_full_ds_evals: usize,
 
-    /// Total number of individual adapter `evaluate()` calls consumed.
+    /// Total number of per-example metric evaluations consumed.
     pub total_num_evals: usize,
 
     /// Optional evaluation cache (disabled when `None`).
-    #[serde(skip)]
     pub evaluation_cache: Option<EvaluationCache>,
 
     // ---- Program trace --------------------------------------------------
@@ -634,6 +633,17 @@ impl<Id: DataId> GEPAState<Id> {
         valset_evaluation: ValsetEvaluation<Id>,
         num_metric_calls_by_discovery_of_new_program: usize,
     ) -> Result<ProgramIdx> {
+        if matches!(
+            self.frontier_type,
+            FrontierType::Objective | FrontierType::Hybrid | FrontierType::Cartesian
+        ) && valset_evaluation.objective_scores_by_val_id.is_none()
+        {
+            return Err(GEPAError::Config(format!(
+                "frontier_type={:?} requires objective_scores in valset_evaluation",
+                self.frontier_type
+            )));
+        }
+
         let new_program_idx = self.program_candidates.len();
 
         // Advance the round-robin component counter.
@@ -660,6 +670,31 @@ impl<Id: DataId> GEPAState<Id> {
         self.prog_candidate_objective_scores
             .push(objective_scores.clone());
 
+        let best_output_updates = if self.best_outputs_valset.is_some() {
+            valset_scores
+                .iter()
+                .filter_map(|(val_id, &score)| {
+                    let previous_best = self
+                        .pareto_front_valset
+                        .get(val_id)
+                        .copied()
+                        .unwrap_or(f64::NEG_INFINITY);
+                    if score > previous_best {
+                        let output = valset_evaluation
+                            .outputs_by_val_id
+                            .get(val_id)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        Some((val_id.clone(), output))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
         // Update instance-level front.
         for (val_id, &score) in &valset_scores {
             self.update_pareto_front_for_val_id(val_id, score, new_program_idx);
@@ -667,24 +702,8 @@ impl<Id: DataId> GEPAState<Id> {
 
         // Update best-output tracking (Gap 5).
         if let Some(ref mut best_map) = self.best_outputs_valset {
-            for (val_id, &score) in &valset_scores {
-                let is_better = best_map.get(val_id).is_none_or(|(_, _)| {
-                    // Compare against the current Pareto front score.
-                    let prev = self
-                        .pareto_front_valset
-                        .get(val_id)
-                        .copied()
-                        .unwrap_or(f64::NEG_INFINITY);
-                    score > prev
-                });
-                if is_better {
-                    let output = valset_evaluation
-                        .outputs_by_val_id
-                        .get(val_id)
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    best_map.insert(val_id.clone(), (new_program_idx, output));
-                }
+            for (val_id, output) in best_output_updates {
+                best_map.insert(val_id, (new_program_idx, output));
             }
         }
 
@@ -1023,22 +1042,38 @@ impl<Id: DataId> GEPAState<Id> {
                 let new_outputs_vec: Vec<serde_json::Value> = uncached_ids
                     .iter()
                     .map(|id| {
-                        new_outputs
-                            .get(id)
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null)
+                        new_outputs.get(id).cloned().ok_or_else(|| {
+                            GEPAError::Evaluation(format!(
+                                "evaluator did not return an output for validation id {id:?}"
+                            ))
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 let new_scores_vec: Vec<f64> = uncached_ids
                     .iter()
-                    .map(|id| new_scores.get(id).copied().unwrap_or(0.0))
-                    .collect();
-                let new_obj_vec: Option<Vec<ObjectiveScores>> = new_obj.as_ref().map(|obj_map| {
-                    uncached_ids
-                        .iter()
-                        .map(|id| obj_map.get(id).cloned().unwrap_or_default())
-                        .collect()
-                });
+                    .map(|id| {
+                        new_scores.get(id).copied().ok_or_else(|| {
+                            GEPAError::Evaluation(format!(
+                                "evaluator did not return a score for validation id {id:?}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                let new_obj_vec: Option<Vec<ObjectiveScores>> = new_obj
+                    .as_ref()
+                    .map(|obj_map| {
+                        uncached_ids
+                            .iter()
+                            .map(|id| {
+                                obj_map.get(id).cloned().ok_or_else(|| {
+                                    GEPAError::Evaluation(format!(
+                                        "evaluator did not return objective scores for validation id {id:?}"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 #[allow(clippy::unwrap_used)]
                 // SAFETY: guarded by is_some() check above; split-phase borrows
                 let cache = self.evaluation_cache.as_mut().unwrap();
@@ -1082,6 +1117,26 @@ impl<Id: DataId> GEPAState<Id> {
                 objective_scores_by_val_id
                     .get_or_insert_with(HashMap::new)
                     .extend(new_obj_map.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+
+            for id in example_ids {
+                if !outputs_by_val_id.contains_key(id) {
+                    return Err(GEPAError::Evaluation(format!(
+                        "missing output for validation id {id:?}"
+                    )));
+                }
+                if !scores_by_val_id.contains_key(id) {
+                    return Err(GEPAError::Evaluation(format!(
+                        "missing score for validation id {id:?}"
+                    )));
+                }
+                if let Some(ref objectives) = objective_scores_by_val_id
+                    && !objectives.contains_key(id)
+                {
+                    return Err(GEPAError::Evaluation(format!(
+                        "missing objective scores for validation id {id:?}"
+                    )));
+                }
             }
 
             Ok((
@@ -1442,6 +1497,73 @@ mod tests {
         assert!(
             result.is_err(),
             "Cartesian frontier update without objective scores should return Err"
+        );
+    }
+
+    #[test]
+    fn test_objective_frontier_update_missing_objectives_errors() {
+        let seed_objs: Vec<ObjectiveScores> =
+            vec![[("accuracy".into(), 0.5_f64)].into_iter().collect()];
+        let eval = make_seed_evaluation_with_objectives(&[0], &[0.5], seed_objs);
+        let mut state = GEPAState::new(make_seed_candidate(), eval, FrontierType::Objective, None)
+            .expect("construction should succeed");
+
+        let bad_eval = ValsetEvaluation::from_vecs(
+            vec![0usize],
+            vec![serde_json::json!("out")],
+            vec![0.9],
+            None,
+        );
+        let mut new_candidate = make_seed_candidate();
+        new_candidate.insert("instructions".into(), "no objectives".into());
+
+        let result = state.update_state_with_new_program(vec![0], new_candidate, bad_eval, 1);
+        assert!(
+            result.is_err(),
+            "Objective frontier update without objective scores should return Err"
+        );
+    }
+
+    #[test]
+    fn test_best_outputs_update_on_improvement_only() {
+        let seed_eval = ValsetEvaluation::from_vecs(
+            vec![0usize, 1],
+            vec![serde_json::json!("seed0"), serde_json::json!("seed1")],
+            vec![0.2, 0.8],
+            None,
+        );
+        let mut state = GEPAState::new_with_options(
+            make_seed_candidate(),
+            seed_eval,
+            FrontierType::Instance,
+            None,
+            true,
+        )
+        .expect("construction should succeed");
+
+        let new_eval = ValsetEvaluation::from_vecs(
+            vec![0usize, 1],
+            vec![serde_json::json!("new0"), serde_json::json!("new1")],
+            vec![0.9, 0.7],
+            None,
+        );
+        let mut new_candidate = make_seed_candidate();
+        new_candidate.insert("instructions".into(), "better on id 0".into());
+        let new_idx = state
+            .update_state_with_new_program(vec![0], new_candidate, new_eval, 2)
+            .expect("update should succeed");
+
+        let best_outputs = state
+            .best_outputs_valset
+            .as_ref()
+            .expect("best outputs should be tracked");
+        assert_eq!(
+            best_outputs.get(&0).map(|(idx, out)| (*idx, out.clone())),
+            Some((new_idx, serde_json::json!("new0")))
+        );
+        assert_eq!(
+            best_outputs.get(&1).map(|(idx, out)| (*idx, out.clone())),
+            Some((0, serde_json::json!("seed1")))
         );
     }
 

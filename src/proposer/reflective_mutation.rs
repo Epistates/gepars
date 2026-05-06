@@ -15,9 +15,11 @@
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::core::adapter::{Candidate, GEPAAdapter, ReflectiveDataset};
+use crate::core::component::{ComponentKind, ComponentMeta, ComponentMetaMap};
 use crate::core::data_loader::{DataId, DataLoader};
 use crate::core::state::GEPAState;
 use crate::error::{GEPAError, Result};
@@ -27,7 +29,8 @@ use crate::strategies::batch_sampler::BatchSampler;
 use crate::strategies::candidate_selector::CandidateSelector;
 use crate::strategies::component_selector::ComponentSelector;
 use crate::strategies::instruction_proposal::{
-    extract_output, format_samples_as_markdown, render_prompt, render_prompt_with_template,
+    extract_output, format_samples_as_markdown, render_code_prompt, render_config_prompt,
+    render_prompt, render_prompt_with_template,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,13 +74,13 @@ impl PromptTemplateConfig {
 /// - `Id`     — data example identifier type.
 /// - `Item`   — training data instance type.
 /// - `T`      — execution trace type (opaque).
-/// - `RO`     — raw rollout output type (opaque).
+/// - `RO`     — raw rollout output type, serializable for engine bookkeeping.
 pub struct ReflectiveMutationProposer<Id, Item, T, RO>
 where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Training data loader.
     pub trainset: Arc<dyn DataLoader<Id, Item>>,
@@ -96,6 +99,11 @@ where
     /// `Some(Single(s))` → use `s` for every component.
     /// `Some(PerComponent(map))` → look up per-component; fall back to default.
     pub reflection_prompt_template: Option<PromptTemplateConfig>,
+    /// Optional metadata for component-aware prompt rendering.
+    ///
+    /// Components absent from this map are treated as plain text, preserving
+    /// the original GEPA behavior.
+    pub component_metadata: ComponentMetaMap,
     /// Target score for "skip if perfect" logic.
     pub perfect_score: Option<f64>,
     /// When `true`, skip iterations where all minibatch scores are already perfect.
@@ -107,7 +115,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Propose improved text for a single component.
     ///
@@ -125,11 +133,17 @@ where
         let dataset_str = format_samples_as_markdown(records);
 
         let prompt = match &self.reflection_prompt_template {
-            None => render_prompt(current_text, &dataset_str),
+            None => {
+                self.render_default_prompt_for_component(component_name, current_text, &dataset_str)
+            }
             Some(cfg) => match cfg.get_for_component(component_name) {
                 Some(template) => render_prompt_with_template(template, current_text, &dataset_str)
                     .map_err(GEPAError::Config)?,
-                None => render_prompt(current_text, &dataset_str),
+                None => self.render_default_prompt_for_component(
+                    component_name,
+                    current_text,
+                    &dataset_str,
+                ),
             },
         };
 
@@ -144,6 +158,60 @@ where
 
         Ok(new_text)
     }
+
+    fn render_default_prompt_for_component(
+        &self,
+        component_name: &str,
+        current_text: &str,
+        dataset_str: &str,
+    ) -> String {
+        let Some(meta) = self.component_metadata.get(component_name) else {
+            return render_prompt(current_text, dataset_str);
+        };
+
+        let prompt = match meta.kind {
+            ComponentKind::Text => render_prompt(current_text, dataset_str),
+            ComponentKind::Code => render_code_prompt(
+                current_text,
+                dataset_str,
+                component_name,
+                meta.language.as_deref().unwrap_or("text"),
+            ),
+            ComponentKind::Config => {
+                let constraints = format_constraints(meta);
+                render_config_prompt(current_text, dataset_str, constraints.as_deref())
+            }
+        };
+
+        with_component_description(meta, prompt)
+    }
+}
+
+fn format_constraints(meta: &ComponentMeta) -> Option<String> {
+    let constraints = meta.constraints.as_ref()?;
+    if constraints.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<(&String, &String)> = constraints.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+
+    Some(
+        entries
+            .into_iter()
+            .map(|(key, value)| format!("- {key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn with_component_description(meta: &ComponentMeta, prompt: String) -> String {
+    let description = meta.description.trim();
+    if description.is_empty() {
+        prompt
+    } else {
+        format!("Component description: {description}\n\n{prompt}")
+    }
 }
 
 impl<Id, Item, T, RO> ReflectiveMutationProposer<Id, Item, T, RO>
@@ -151,7 +219,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Gap 7: Propose new texts for all selected components.
     ///
@@ -242,6 +310,7 @@ where
             .evaluate(&minibatch, &curr_prog, true)
             .await
             .map_err(|e| GEPAError::Evaluation(e.to_string()))?;
+        eval_curr.validate_lengths(minibatch.len(), false)?;
 
         state.increment_evals(subsample_ids.len());
 
@@ -339,6 +408,7 @@ where
             .evaluate(&minibatch, &new_candidate, false)
             .await
             .map_err(|e| GEPAError::Evaluation(e.to_string()))?;
+        eval_new.validate_lengths(minibatch.len(), false)?;
 
         state.increment_evals(subsample_ids.len());
 
@@ -437,6 +507,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
             reflection_lm: Arc::new(EchoLM),
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             perfect_score: Some(1.0),
             skip_perfect_score: false, // don't skip perfect so we exercise the full path
         }
@@ -519,6 +590,7 @@ mod tests {
                 batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
                 reflection_lm: Arc::new(EchoLM),
                 reflection_prompt_template: None,
+                component_metadata: ComponentMetaMap::new(),
                 perfect_score: None,
                 skip_perfect_score: false,
             };
@@ -552,6 +624,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
             reflection_lm: Arc::new(EmptyLM),
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             perfect_score: None,
             skip_perfect_score: false,
         };
@@ -617,6 +690,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
             reflection_lm: Arc::new(EchoLM),
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             perfect_score: None,
             skip_perfect_score: false,
         };
@@ -674,6 +748,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
             reflection_lm: Arc::new(EchoLM),
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             perfect_score: None,
             skip_perfect_score: false,
         };
@@ -687,6 +762,73 @@ mod tests {
             result.is_none(),
             "empty reflective dataset for all components should return Ok(None)"
         );
+    }
+
+    #[tokio::test]
+    async fn code_component_metadata_uses_code_prompt() {
+        use std::sync::Mutex;
+
+        struct RecordingLM {
+            prompt: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LanguageModel for RecordingLM {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                *self.prompt.lock().unwrap() = Some(prompt.to_string());
+                Ok("```rust\nfn improved() {}\n```".into())
+            }
+        }
+
+        let recorded_prompt = Arc::new(Mutex::new(None));
+
+        let mut seed = Candidate::new();
+        seed.insert("model_code".into(), "fn current() {}".into());
+        let eval = ValsetEvaluation::from_vecs(
+            vec![0usize],
+            vec![serde_json::json!("out")],
+            vec![0.5],
+            None,
+        );
+        let mut state =
+            GEPAState::new(seed, eval, FrontierType::Instance, None).expect("should construct");
+        state.i = state.i.wrapping_add(1);
+
+        let mut component_metadata = ComponentMetaMap::new();
+        component_metadata.insert(
+            "model_code".into(),
+            ComponentMeta::code("Updates the model architecture", "rust"),
+        );
+
+        let mut proposer = ReflectiveMutationProposer {
+            trainset: Arc::new(VecLoader::new(vec!["ex0".to_string(), "ex1".to_string()])),
+            adapter: Arc::new(PerfectAdapter),
+            candidate_selector: Box::new(CurrentBestSelector),
+            component_selector: Box::new(AllComponentSelector),
+            batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).unwrap()),
+            reflection_lm: Arc::new(RecordingLM {
+                prompt: recorded_prompt.clone(),
+            }),
+            reflection_prompt_template: None,
+            component_metadata,
+            perfect_score: None,
+            skip_perfect_score: false,
+        };
+
+        let proposal = proposer
+            .propose_mut(&mut state)
+            .await
+            .expect("should not error");
+        assert!(proposal.is_some());
+
+        let prompt = recorded_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("LM should have been called");
+        assert!(prompt.contains("Component description: Updates the model architecture"));
+        assert!(prompt.contains("model_code component"));
+        assert!(prompt.contains("```rust"));
     }
 
     // ------------------------------------------------------------------
@@ -767,6 +909,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 1).unwrap()),
             reflection_lm: Arc::new(EchoLM),
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             perfect_score: None,
             skip_perfect_score: false,
         };

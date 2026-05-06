@@ -13,6 +13,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use serde::Serialize;
 use tracing::debug;
 
 use crate::core::adapter::{Candidate, GEPAAdapter};
@@ -272,7 +273,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Validation dataset loader (for subsample eval).
     pub valset: Arc<dyn DataLoader<Id, Item>>,
@@ -300,7 +301,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Construct a new `MergeProposer`.
     ///
@@ -518,6 +519,7 @@ where
             .evaluate(&mini_devset, &new_program, false)
             .await
             .map_err(|e| GEPAError::Evaluation(e.to_string()))?;
+        eval_new.validate_lengths(mini_devset.len(), false)?;
 
         state.increment_evals(subsample_ids.len());
 

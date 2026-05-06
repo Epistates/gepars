@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use serde::Serialize;
 use serde_json::Value;
 
 /// A program candidate: mapping from component name to component text.
@@ -22,7 +23,9 @@ pub type Candidate = IndexMap<String, String>;
 ///
 /// Generic over:
 /// - `T`: the per-example trajectory type (opaque to the engine).
-/// - `RO`: the per-example raw output type (opaque to the engine).
+/// - `RO`: the per-example raw output type. It must be serializable so the
+///   engine can preserve outputs in callbacks, cache entries, and best-output
+///   tracking.
 ///
 /// Correctness constraints:
 /// - `outputs.len() == scores.len() == batch.len()`
@@ -31,7 +34,8 @@ pub type Candidate = IndexMap<String, String>;
 #[derive(Debug, Clone)]
 pub struct EvaluationBatch<T, RO> {
     /// Raw per-example outputs produced by executing the candidate.
-    /// GEPA does not interpret these; they are passed through to callbacks.
+    /// GEPA serializes these for callbacks, cache entries, and best-output
+    /// tracking, but does not otherwise interpret them.
     pub outputs: Vec<RO>,
 
     /// Per-example numeric scores.  Higher is better.  GEPA sums these for
@@ -70,6 +74,96 @@ impl<T, RO> EvaluationBatch<T, RO> {
         self.objective_scores = Some(objective_scores);
         self
     }
+
+    /// Validate that every vector in the batch is aligned with the requested
+    /// batch size.
+    ///
+    /// # Errors
+    /// Returns an evaluation error when outputs, scores, trajectories, or
+    /// objective scores are length-misaligned, or when any score is not finite.
+    pub fn validate_lengths(
+        &self,
+        expected_len: usize,
+        require_trajectories: bool,
+    ) -> crate::error::Result<()> {
+        if self.outputs.len() != expected_len {
+            return Err(crate::error::GEPAError::Evaluation(format!(
+                "adapter returned {} outputs for a batch of {expected_len}",
+                self.outputs.len()
+            )));
+        }
+
+        if self.scores.len() != expected_len {
+            return Err(crate::error::GEPAError::Evaluation(format!(
+                "adapter returned {} scores for a batch of {expected_len}",
+                self.scores.len()
+            )));
+        }
+
+        if let Some((idx, score)) = self
+            .scores
+            .iter()
+            .enumerate()
+            .find(|(_, score)| !score.is_finite())
+        {
+            return Err(crate::error::GEPAError::Evaluation(format!(
+                "adapter returned non-finite score at index {idx}: {score}"
+            )));
+        }
+
+        match (&self.trajectories, require_trajectories) {
+            (Some(trajectories), _) if trajectories.len() != expected_len => {
+                return Err(crate::error::GEPAError::Evaluation(format!(
+                    "adapter returned {} trajectories for a batch of {expected_len}",
+                    trajectories.len()
+                )));
+            }
+            (None, true) => {
+                return Err(crate::error::GEPAError::Evaluation(
+                    "adapter did not return trajectories for a trace-capturing evaluation".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        if let Some(objective_scores) = &self.objective_scores {
+            if objective_scores.len() != expected_len {
+                return Err(crate::error::GEPAError::Evaluation(format!(
+                    "adapter returned {} objective-score rows for a batch of {expected_len}",
+                    objective_scores.len()
+                )));
+            }
+
+            for (idx, objectives) in objective_scores.iter().enumerate() {
+                if let Some((name, score)) = objectives.iter().find(|(_, score)| !score.is_finite())
+                {
+                    return Err(crate::error::GEPAError::Evaluation(format!(
+                        "adapter returned non-finite objective score at index {idx} for '{name}': {score}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<T, RO> EvaluationBatch<T, RO>
+where
+    RO: Serialize,
+{
+    /// Convert raw outputs into JSON values, preserving order.
+    ///
+    /// # Errors
+    /// Returns a serialization error if any output cannot be represented as
+    /// JSON.
+    pub fn outputs_as_json(&self) -> crate::error::Result<Vec<Value>> {
+        self.outputs
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 }
 
 /// A generic reflective dataset: component name → list of JSON records.
@@ -106,7 +200,7 @@ pub trait GEPAAdapter<DataInst, T, RO>: Send + Sync
 where
     DataInst: Send,
     T: Send,
-    RO: Send,
+    RO: Send + Serialize,
 {
     /// Execute the program defined by `candidate` on a batch of inputs.
     ///

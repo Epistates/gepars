@@ -17,6 +17,8 @@ use tracing::{debug, warn};
 
 use crate::error::{GEPAError, Result};
 
+const MAX_ERROR_BODY_CHARS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // LanguageModel trait
 // ---------------------------------------------------------------------------
@@ -152,7 +154,7 @@ impl OpenAICompatibleLM {
         max_tokens: Option<u32>,
     ) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()
             .map_err(|e| GEPAError::Config(format!("Failed to build HTTP client: {e}")))?;
 
@@ -214,12 +216,7 @@ impl OpenAICompatibleLM {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            // Truncate body to avoid leaking sensitive account data in logs
-            let truncated = if body.len() > 256 {
-                format!("{}...[truncated]", &body[..256])
-            } else {
-                body
-            };
+            let truncated = truncate_error_body(&body);
             return Err(GEPAError::LmApi(format!(
                 "API returned HTTP {status}: {truncated}"
             )));
@@ -277,8 +274,9 @@ impl OpenAICompatibleLM {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            let truncated = truncate_error_body(&body);
             return Err(GEPAError::LmApi(format!(
-                "Streaming API returned HTTP {status}: {body}"
+                "Streaming API returned HTTP {status}: {truncated}"
             )));
         }
 
@@ -311,6 +309,19 @@ impl OpenAICompatibleLM {
         }
 
         Ok(accumulated)
+    }
+}
+
+fn truncate_error_body(body: &str) -> String {
+    let mut chars = body.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_ERROR_BODY_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...[truncated]")
+    } else {
+        body.to_string()
     }
 }
 
@@ -439,18 +450,14 @@ mod tests {
 
     #[test]
     fn test_error_body_truncation() {
-        // The truncation logic in complete_non_streaming is:
-        //   if body.len() > 256 { format!("{}...[truncated]", &body[..256]) }
-        // We replicate that logic here and assert the result is bounded.
         let long_body = "x".repeat(600);
-        let truncated = if long_body.len() > 256 {
-            format!("{}...[truncated]", &long_body[..256])
-        } else {
-            long_body.clone()
-        };
+        let truncated = truncate_error_body(&long_body);
 
         // The truncated string must start with the first 256 chars.
-        assert_eq!(&truncated[..256], &long_body[..256]);
+        assert_eq!(
+            truncated.chars().take(256).collect::<String>(),
+            long_body.chars().take(256).collect::<String>()
+        );
         // And must end with the sentinel.
         assert!(
             truncated.ends_with("...[truncated]"),
@@ -461,16 +468,20 @@ mod tests {
 
         // A body that fits within 256 chars must NOT be truncated.
         let short_body = "y".repeat(100);
-        let not_truncated = if short_body.len() > 256 {
-            format!("{}...[truncated]", &short_body[..256])
-        } else {
-            short_body.clone()
-        };
+        let not_truncated = truncate_error_body(&short_body);
         assert_eq!(
             not_truncated, short_body,
             "short body should be passed through unchanged"
         );
         assert!(!not_truncated.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn test_error_body_truncation_handles_multibyte_text() {
+        let body = "é".repeat(300);
+        let truncated = truncate_error_body(&body);
+        assert!(truncated.ends_with("...[truncated]"));
+        assert_eq!(truncated.chars().take(256).count(), 256);
     }
 
     // ------------------------------------------------------------------
@@ -517,6 +528,100 @@ mod tests {
                 case.base_url
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mock_non_streaming_completion_returns_message() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {"content": "world"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lm = OpenAICompatibleLM::new("test-model", "", server.uri(), None, Some(32))
+            .expect("should build")
+            .with_max_retries(0);
+        let response = lm.complete("hello").await.expect("mock should succeed");
+        assert_eq!(response, "world");
+    }
+
+    #[tokio::test]
+    async fn mock_completion_retries_transient_server_error() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("try again"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {"content": "recovered"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lm = OpenAICompatibleLM::new("test-model", "", server.uri(), None, Some(32))
+            .expect("should build")
+            .with_max_retries(1);
+        let response = lm.complete("hello").await.expect("retry should recover");
+        assert_eq!(response, "recovered");
+    }
+
+    #[tokio::test]
+    async fn mock_streaming_completion_accumulates_sse_chunks() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lm = OpenAICompatibleLM::new("test-model", "", server.uri(), None, Some(32))
+            .expect("should build")
+            .with_streaming(true)
+            .with_max_retries(0);
+        let response = lm
+            .complete("hello")
+            .await
+            .expect("streaming mock should succeed");
+        assert_eq!(response, "hello");
     }
 
     /// Integration test (requires a live server — skipped in CI).

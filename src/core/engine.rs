@@ -1,8 +1,8 @@
 /// `GEPAEngine` — Algorithm 1 of the GEPA paper.
 ///
 /// The engine owns the full optimisation loop:
-/// 1. Evaluate the seed candidate on the full validation set and build the
-///    initial [`GEPAState`].
+/// 1. Load a saved [`GEPAState`] when available, otherwise evaluate the seed
+///    candidate on the full validation set and build the initial state.
 /// 2. Loop until the stop condition fires:
 ///    a. If a merge attempt is scheduled, invoke [`MergeProposer::propose_mut`].
 ///       Accept if `sum(new_scores) >= max(p1_sum, p2_sum)`.
@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::Serialize;
 use tracing::{debug, info};
 
 use crate::core::adapter::{Candidate, EvaluationBatch, GEPAAdapter};
@@ -29,7 +30,9 @@ use crate::core::callbacks::{
 };
 use crate::core::data_loader::{DataId, DataLoader};
 use crate::core::result::GEPAResult;
-use crate::core::state::{EvaluationCache, FrontierType, GEPAState, ValsetEvaluation};
+use crate::core::state::{
+    CachedEvaluation, EvaluationCache, FrontierType, GEPAState, ObjectiveScores, ValsetEvaluation,
+};
 use crate::error::{GEPAError, Result};
 use crate::proposer::merge::MergeProposer;
 use crate::proposer::reflective_mutation::ReflectiveMutationProposer;
@@ -47,7 +50,7 @@ use crate::utils::stop_condition::StopCondition;
 /// - `Id`   — data example identifier (implements [`DataId`]).
 /// - `Item` — training / validation data instance type.
 /// - `T`    — execution trace type (opaque to the engine).
-/// - `RO`   — raw rollout output type (opaque to the engine).
+/// - `RO`   — raw rollout output type, serialized for callbacks/cache/results.
 ///
 /// ### Ownership model
 /// The engine owns all strategies and proposers.  All shared resources
@@ -57,7 +60,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     // ---- Data ---------------------------------------------------------------
     /// Training data loader (used by proposers internally via `Arc` clone).
@@ -114,7 +117,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     // ------------------------------------------------------------------
     // run — Algorithm 1
@@ -126,9 +129,8 @@ where
     /// Returns `Err` on unrecoverable adapter failures or when the seed
     /// evaluation produces no validation examples.
     pub async fn run(&mut self) -> Result<GEPAResult<Id>> {
-        // ── Step 1: collect validation IDs and items ─────────────────────────
+        // ── Step 1: collect validation IDs ───────────────────────────────────
         let all_val_ids = self.valset.all_ids();
-        let all_val_items = self.valset.fetch(&all_val_ids)?;
 
         if all_val_ids.is_empty() {
             return Err(GEPAError::Config(
@@ -147,109 +149,129 @@ where
             });
         });
 
-        // ── Step 2: evaluate the seed on the full valset ─────────────────────
-        info!(
-            valset_size = all_val_ids.len(),
-            "Evaluating seed candidate on full validation set"
-        );
+        // ── Step 2: build or resume state ────────────────────────────────────
+        let state_path = self
+            .run_dir
+            .as_ref()
+            .map(|run_dir| Path::new(run_dir).join("gepa_state.json"));
 
-        notify_callbacks(&self.callbacks, |cb| {
-            cb.on_evaluation_start(&EvaluationStartEvent {
-                iteration: 0,
-                candidate_idx: None,
-                batch_size: all_val_items.len(),
-                capture_traces: false,
-                parent_ids: vec![],
-                is_seed_candidate: true,
-            });
-        });
-
-        let seed_eval = self
-            .adapter
-            .evaluate(&all_val_items, &self.seed_candidate, false)
-            .await?;
-
-        notify_callbacks(&self.callbacks, |cb| {
-            cb.on_evaluation_end(&EvaluationEndEvent {
-                iteration: 0,
-                candidate_idx: None,
-                scores: seed_eval.scores.clone(),
-                has_trajectories: seed_eval.trajectories.is_some(),
-                parent_ids: vec![],
-                outputs: seed_eval
-                    .outputs
-                    .iter()
-                    .map(|_| serde_json::Value::Null)
-                    .collect(),
-                objective_scores: seed_eval.objective_scores.clone(),
-                is_seed_candidate: true,
-            });
-        });
-
-        let seed_valset_eval = build_valset_evaluation(&all_val_ids, &seed_eval);
-
-        // ── Step 3: build or resume the state (Gap 3) ────────────────────────
-        let evaluation_cache = if self.cache_evaluation {
-            Some(EvaluationCache::new())
+        let loaded_state = if let Some(state_path) = state_path.as_ref() {
+            if state_path.exists() {
+                info!(path = %state_path.display(), "Resuming from saved state");
+                let json = std::fs::read_to_string(state_path)
+                    .map_err(|e| GEPAError::Config(format!("Failed to read state file: {e}")))?;
+                let mut loaded = GEPAState::<Id>::from_json(&json)?;
+                // Sync cache with current run setting.
+                if self.cache_evaluation {
+                    if loaded.evaluation_cache.is_none() {
+                        loaded.evaluation_cache = Some(EvaluationCache::new());
+                    }
+                } else {
+                    loaded.evaluation_cache = None;
+                }
+                Some(loaded)
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        let mut state = if let Some(ref run_dir) = self.run_dir {
-            let state_path = Path::new(run_dir).join("gepa_state.json");
-            if state_path.exists() {
-                info!(path = %state_path.display(), "Resuming from saved state");
-                let json = std::fs::read_to_string(&state_path)
-                    .map_err(|e| GEPAError::Config(format!("Failed to read state file: {e}")))?;
-                let mut loaded = GEPAState::<Id>::from_json(&json)?;
-                // Sync cache with current run setting.
-                if evaluation_cache.is_none() {
-                    loaded.evaluation_cache = None;
-                } else if loaded.evaluation_cache.is_none() {
-                    loaded.evaluation_cache = evaluation_cache;
-                }
-                loaded
-            } else {
-                GEPAState::new_with_options(
-                    self.seed_candidate.clone(),
-                    seed_valset_eval,
-                    self.frontier_type,
-                    evaluation_cache,
-                    self.track_best_outputs,
-                )?
-            }
+        let (mut state, initial_budget_delta) = if let Some(loaded) = loaded_state {
+            (loaded, 0)
         } else {
-            GEPAState::new_with_options(
+            info!(
+                valset_size = all_val_ids.len(),
+                "Evaluating seed candidate on full validation set"
+            );
+
+            notify_callbacks(&self.callbacks, |cb| {
+                cb.on_evaluation_start(&EvaluationStartEvent {
+                    iteration: 0,
+                    candidate_idx: None,
+                    batch_size: all_val_ids.len(),
+                    capture_traces: false,
+                    parent_ids: vec![],
+                    is_seed_candidate: true,
+                });
+            });
+
+            let seed_outcome = self
+                .evaluate_valset_uncached(&self.seed_candidate, &all_val_ids)
+                .await?;
+
+            notify_callbacks(&self.callbacks, |cb| {
+                cb.on_evaluation_end(&EvaluationEndEvent {
+                    iteration: 0,
+                    candidate_idx: None,
+                    scores: seed_outcome.scores.clone(),
+                    has_trajectories: false,
+                    parent_ids: vec![],
+                    outputs: seed_outcome.outputs.clone(),
+                    objective_scores: seed_outcome.objective_scores.clone(),
+                    is_seed_candidate: true,
+                });
+            });
+
+            let mut cache = if self.cache_evaluation {
+                Some(EvaluationCache::new())
+            } else {
+                None
+            };
+            if let Some(ref mut cache) = cache {
+                cache.put_batch(
+                    &self.seed_candidate,
+                    &all_val_ids,
+                    seed_outcome.outputs.clone(),
+                    seed_outcome.scores.clone(),
+                    seed_outcome.objective_scores.clone(),
+                );
+            }
+
+            let state = GEPAState::new_with_options(
                 self.seed_candidate.clone(),
-                seed_valset_eval,
+                seed_outcome.valset_evaluation,
                 self.frontier_type,
-                evaluation_cache,
+                cache,
                 self.track_best_outputs,
-            )?
+            )?;
+            (state, seed_outcome.metric_evals)
         };
 
-        // Seed counted as one full-valset evaluation (only when initialising fresh).
+        if state.evaluation_cache.is_some() != self.cache_evaluation {
+            state.evaluation_cache = if self.cache_evaluation {
+                Some(EvaluationCache::new())
+            } else {
+                None
+            };
+        }
+
+        // Seed counted as one logical full-valset evaluation only on fresh runs.
         if state.num_full_ds_evals == 0 {
             state.num_full_ds_evals = 1;
-            state.total_num_evals = all_val_ids.len();
+            state.total_num_evals = initial_budget_delta;
+        }
+
+        if state.program_candidates.is_empty() {
+            return Err(GEPAError::NoCandidates);
         }
 
         notify_callbacks(&self.callbacks, |cb| {
             cb.on_budget_updated(&BudgetUpdatedEvent {
                 iteration: 0,
                 metric_calls_used: state.total_num_evals,
-                metric_calls_delta: all_val_ids.len(),
+                metric_calls_delta: initial_budget_delta,
                 metric_calls_remaining: None,
             });
         });
 
         let (seed_score, _) = state.get_program_average_val_subset(0);
-        info!(seed_score, "Seed candidate evaluated");
+        info!(seed_score, "Seed candidate available");
 
         // Log seed metrics to tracker (Gap 9).
         self.tracker.log_metric("seed_score", seed_score, 0);
 
-        // ── Step 4: main optimisation loop ───────────────────────────────────
+        // ── Step 3: main optimisation loop ───────────────────────────────────
         loop {
             // Advance iteration counter.
             // BEFORE_FIRST_ITERATION = usize::MAX; wrapping_add(1) → 0.
@@ -285,12 +307,10 @@ where
 
             let accepted = if self.merge_proposer.merges_due > 0 {
                 // ── Merge attempt (Algorithm 4) ──────────────────────────────
-                self.try_merge_step(&mut state, &all_val_ids, &all_val_items)
-                    .await?
+                self.try_merge_step(&mut state, &all_val_ids).await?
             } else {
                 // ── Reflective mutation (Algorithm 3) ────────────────────────
-                self.try_mutation_step(&mut state, &all_val_ids, &all_val_items)
-                    .await?
+                self.try_mutation_step(&mut state, &all_val_ids).await?
             };
 
             // ── Gap 4: push a trace entry ────────────────────────────────────
@@ -396,7 +416,6 @@ where
         &mut self,
         state: &mut GEPAState<Id>,
         all_val_ids: &[Id],
-        all_val_items: &[Item],
     ) -> Result<bool> {
         debug!(
             iteration = state.i,
@@ -450,13 +469,7 @@ where
 
         // ── Full validation-set evaluation for the accepted merge ──────────
         let (new_idx, evals_delta) = self
-            .full_valset_eval_and_accept(
-                state,
-                merged_candidate,
-                parent_ids.clone(),
-                all_val_ids,
-                all_val_items,
-            )
+            .full_valset_eval_and_accept(state, merged_candidate, parent_ids.clone(), all_val_ids)
             .await?;
 
         // Only decrement merges_due on acceptance (matching reference behavior).
@@ -500,7 +513,6 @@ where
         &mut self,
         state: &mut GEPAState<Id>,
         all_val_ids: &[Id],
-        all_val_items: &[Item],
     ) -> Result<bool> {
         let proposal = self.mutation_proposer.propose_mut(state).await?;
 
@@ -549,13 +561,7 @@ where
 
         // ── Full validation-set evaluation for the accepted mutation ───────
         let (new_idx, evals_delta) = self
-            .full_valset_eval_and_accept(
-                state,
-                candidate,
-                parent_ids.clone(),
-                all_val_ids,
-                all_val_items,
-            )
+            .full_valset_eval_and_accept(state, candidate, parent_ids.clone(), all_val_ids)
             .await?;
 
         let new_score = state.get_program_average_val_subset(new_idx).0;
@@ -605,44 +611,36 @@ where
         candidate: Candidate,
         parent_ids: Vec<usize>,
         all_val_ids: &[Id],
-        all_val_items: &[Item],
     ) -> Result<(usize, usize)> {
-        let evals_delta = all_val_items.len();
-
         notify_callbacks(&self.callbacks, |cb| {
             cb.on_evaluation_start(&EvaluationStartEvent {
                 iteration: state.i,
                 candidate_idx: None, // not yet assigned
-                batch_size: evals_delta,
+                batch_size: all_val_ids.len(),
                 capture_traces: false,
                 parent_ids: parent_ids.clone(),
                 is_seed_candidate: false,
             });
         });
 
-        let eval = self
-            .adapter
-            .evaluate(all_val_items, &candidate, false)
+        let outcome = self
+            .evaluate_valset_with_cache(state, &candidate, all_val_ids)
             .await?;
 
         notify_callbacks(&self.callbacks, |cb| {
             cb.on_evaluation_end(&EvaluationEndEvent {
                 iteration: state.i,
                 candidate_idx: None,
-                scores: eval.scores.clone(),
-                has_trajectories: eval.trajectories.is_some(),
+                scores: outcome.scores.clone(),
+                has_trajectories: false,
                 parent_ids: parent_ids.clone(),
-                outputs: eval
-                    .outputs
-                    .iter()
-                    .map(|_| serde_json::Value::Null)
-                    .collect(),
-                objective_scores: eval.objective_scores.clone(),
+                outputs: outcome.outputs.clone(),
+                objective_scores: outcome.objective_scores.clone(),
                 is_seed_candidate: false,
             });
         });
 
-        let valset_eval = build_valset_evaluation(all_val_ids, &eval);
+        let evals_delta = outcome.metric_evals;
         state.increment_evals(evals_delta);
         state.num_full_ds_evals += 1;
 
@@ -652,7 +650,7 @@ where
         let new_idx = state.update_state_with_new_program(
             parent_ids,
             candidate,
-            valset_eval,
+            outcome.valset_evaluation,
             discovery_count,
         )?;
 
@@ -660,7 +658,7 @@ where
 
         let scores_by_val_id: HashMap<serde_json::Value, f64> = all_val_ids
             .iter()
-            .zip(eval.scores.iter())
+            .zip(outcome.scores.iter())
             .map(|(id, &s)| {
                 (
                     serde_json::to_value(id).unwrap_or(serde_json::Value::Null),
@@ -692,6 +690,71 @@ where
 
         Ok((new_idx, evals_delta))
     }
+
+    async fn evaluate_valset_with_cache(
+        &self,
+        state: &mut GEPAState<Id>,
+        candidate: &Candidate,
+        all_val_ids: &[Id],
+    ) -> Result<FullValsetEvaluation<Id>> {
+        if state.evaluation_cache.is_none() {
+            return self.evaluate_valset_uncached(candidate, all_val_ids).await;
+        }
+
+        let (cached_owned, uncached_ids) = {
+            let Some(cache) = state.evaluation_cache.as_ref() else {
+                return self.evaluate_valset_uncached(candidate, all_val_ids).await;
+            };
+            let (cached_refs, uncached) = cache.get_batch(candidate, all_val_ids);
+            let cached = cached_refs
+                .into_iter()
+                .map(|(id, entry)| (id, entry.clone()))
+                .collect::<HashMap<_, _>>();
+            (cached, uncached)
+        };
+
+        let uncached = if uncached_ids.is_empty() {
+            None
+        } else {
+            Some(
+                self.evaluate_valset_uncached(candidate, &uncached_ids)
+                    .await?,
+            )
+        };
+
+        if let Some(outcome) = uncached.as_ref()
+            && let Some(cache) = state.evaluation_cache.as_mut()
+        {
+            cache.put_batch(
+                candidate,
+                &uncached_ids,
+                outcome.outputs.clone(),
+                outcome.scores.clone(),
+                outcome.objective_scores.clone(),
+            );
+        }
+
+        merge_cached_and_uncached(all_val_ids, cached_owned, uncached_ids, uncached)
+    }
+
+    async fn evaluate_valset_uncached(
+        &self,
+        candidate: &Candidate,
+        val_ids: &[Id],
+    ) -> Result<FullValsetEvaluation<Id>> {
+        let items = self.valset.fetch(val_ids)?;
+        let batch = self.adapter.evaluate(&items, candidate, false).await?;
+        build_valset_evaluation_with_metric_delta(val_ids, &batch, val_ids.len())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FullValsetEvaluation<Id: DataId> {
+    valset_evaluation: ValsetEvaluation<Id>,
+    scores: Vec<f64>,
+    outputs: Vec<serde_json::Value>,
+    objective_scores: Option<Vec<ObjectiveScores>>,
+    metric_evals: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -699,10 +762,22 @@ where
 // ---------------------------------------------------------------------------
 
 /// Build a [`ValsetEvaluation`] from parallel ID and batch-result slices.
-fn build_valset_evaluation<Id: DataId, T: Send, RO: Send>(
+#[cfg(test)]
+fn build_valset_evaluation<Id: DataId, T: Send, RO: Send + Serialize>(
     ids: &[Id],
     batch: &EvaluationBatch<T, RO>,
-) -> ValsetEvaluation<Id> {
+) -> Result<FullValsetEvaluation<Id>> {
+    build_valset_evaluation_with_metric_delta(ids, batch, ids.len())
+}
+
+fn build_valset_evaluation_with_metric_delta<Id: DataId, T: Send, RO: Send + Serialize>(
+    ids: &[Id],
+    batch: &EvaluationBatch<T, RO>,
+    metric_evals: usize,
+) -> Result<FullValsetEvaluation<Id>> {
+    batch.validate_lengths(ids.len(), false)?;
+    let outputs = batch.outputs_as_json()?;
+
     let scores_by_val_id: std::collections::HashMap<Id, f64> = ids
         .iter()
         .cloned()
@@ -716,18 +791,111 @@ fn build_valset_evaluation<Id: DataId, T: Send, RO: Send>(
             .collect::<std::collections::HashMap<Id, _>>()
     });
 
-    // ValsetEvaluation tracks outputs as JSON but the engine only uses scores.
-    let outputs_by_val_id: std::collections::HashMap<Id, serde_json::Value> = ids
-        .iter()
-        .cloned()
-        .map(|id| (id, serde_json::Value::Null))
-        .collect();
+    let outputs_by_val_id: std::collections::HashMap<Id, serde_json::Value> =
+        ids.iter().cloned().zip(outputs.iter().cloned()).collect();
 
-    ValsetEvaluation {
-        outputs_by_val_id,
-        scores_by_val_id,
-        objective_scores_by_val_id,
+    Ok(FullValsetEvaluation {
+        valset_evaluation: ValsetEvaluation {
+            outputs_by_val_id,
+            scores_by_val_id,
+            objective_scores_by_val_id,
+        },
+        scores: batch.scores.clone(),
+        outputs,
+        objective_scores: batch.objective_scores.clone(),
+        metric_evals,
+    })
+}
+
+fn merge_cached_and_uncached<Id: DataId>(
+    all_val_ids: &[Id],
+    cached: HashMap<Id, CachedEvaluation>,
+    uncached_ids: Vec<Id>,
+    uncached: Option<FullValsetEvaluation<Id>>,
+) -> Result<FullValsetEvaluation<Id>> {
+    let metric_evals = uncached.as_ref().map_or(0, |outcome| outcome.metric_evals);
+
+    let mut outputs_by_val_id: HashMap<Id, serde_json::Value> = cached
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.output.clone()))
+        .collect();
+    let mut scores_by_val_id: HashMap<Id, f64> = cached
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.score))
+        .collect();
+    let mut objective_scores_by_val_id: Option<HashMap<Id, ObjectiveScores>> = {
+        let cached_objectives = cached
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .objective_scores
+                    .as_ref()
+                    .map(|objectives| (id.clone(), objectives.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        if cached_objectives.is_empty() {
+            None
+        } else {
+            Some(cached_objectives)
+        }
+    };
+
+    if let Some(outcome) = uncached {
+        outputs_by_val_id.extend(outcome.valset_evaluation.outputs_by_val_id);
+        scores_by_val_id.extend(outcome.valset_evaluation.scores_by_val_id);
+
+        if let Some(objectives) = outcome.valset_evaluation.objective_scores_by_val_id {
+            objective_scores_by_val_id
+                .get_or_insert_with(HashMap::new)
+                .extend(objectives);
+        }
+    } else if !uncached_ids.is_empty() {
+        return Err(GEPAError::Evaluation(
+            "internal cache error: uncached IDs were present but no evaluation was provided".into(),
+        ));
     }
+
+    let mut ordered_outputs = Vec::with_capacity(all_val_ids.len());
+    let mut ordered_scores = Vec::with_capacity(all_val_ids.len());
+    let mut ordered_objectives = objective_scores_by_val_id
+        .as_ref()
+        .map(|_| Vec::with_capacity(all_val_ids.len()));
+
+    for id in all_val_ids {
+        let output = outputs_by_val_id.get(id).cloned().ok_or_else(|| {
+            GEPAError::Evaluation(format!("missing output for validation id {id:?}"))
+        })?;
+        let score = scores_by_val_id.get(id).copied().ok_or_else(|| {
+            GEPAError::Evaluation(format!("missing score for validation id {id:?}"))
+        })?;
+
+        ordered_outputs.push(output);
+        ordered_scores.push(score);
+        if let Some(ref mut objectives) = ordered_objectives {
+            let objective_scores = objective_scores_by_val_id
+                .as_ref()
+                .and_then(|by_id| by_id.get(id))
+                .cloned()
+                .ok_or_else(|| {
+                    GEPAError::Evaluation(format!(
+                        "missing objective scores for validation id {id:?}"
+                    ))
+                })?;
+            objectives.push(objective_scores);
+        }
+    }
+
+    Ok(FullValsetEvaluation {
+        valset_evaluation: ValsetEvaluation {
+            outputs_by_val_id,
+            scores_by_val_id,
+            objective_scores_by_val_id,
+        },
+        scores: ordered_scores,
+        outputs: ordered_outputs,
+        objective_scores: ordered_objectives,
+        metric_evals,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +979,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 42).expect("valid sampler")),
             reflection_lm: Arc::new(MockLM),
             reflection_prompt_template: None,
+            component_metadata: crate::core::component::ComponentMetaMap::new(),
             perfect_score: Some(1.0),
             skip_perfect_score: false,
         };
@@ -873,6 +1042,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_resume_skips_seed_evaluation() {
+        struct FailingAdapter;
+
+        #[async_trait]
+        impl GEPAAdapter<String, (), String> for FailingAdapter {
+            async fn evaluate(
+                &self,
+                _batch: &[String],
+                _candidate: &Candidate,
+                _capture_traces: bool,
+            ) -> Result<EvaluationBatch<(), String>> {
+                Err(crate::error::GEPAError::Evaluation(
+                    "seed evaluation should have been skipped".into(),
+                ))
+            }
+
+            async fn make_reflective_dataset(
+                &self,
+                _candidate: &Candidate,
+                _eval_batch: &EvaluationBatch<(), String>,
+                components: &[String],
+            ) -> Result<ReflectiveDataset> {
+                Ok(components.iter().map(|k| (k.clone(), vec![])).collect())
+            }
+        }
+
+        let run_dir = std::env::temp_dir().join(format!(
+            "gepa-resume-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("create temp run dir");
+
+        let mut seed = Candidate::new();
+        seed.insert("instructions".into(), "saved".into());
+        let eval = ValsetEvaluation::from_vecs(
+            vec![0usize],
+            vec![serde_json::json!("saved-output")],
+            vec![0.7],
+            None,
+        );
+        let mut saved_state =
+            GEPAState::new_with_options(seed.clone(), eval, FrontierType::Instance, None, true)
+                .expect("state should construct");
+        saved_state.num_full_ds_evals = 1;
+        saved_state.total_num_evals = 1;
+        std::fs::write(
+            run_dir.join("gepa_state.json"),
+            saved_state.to_json().expect("state should serialize"),
+        )
+        .expect("write state file");
+
+        let trainset: Arc<dyn DataLoader<usize, String>> =
+            Arc::new(VecLoader::new(vec!["train".into()]));
+        let valset: Arc<dyn DataLoader<usize, String>> =
+            Arc::new(VecLoader::new(vec!["val".into()]));
+        let adapter: Arc<dyn GEPAAdapter<String, (), String>> = Arc::new(FailingAdapter);
+
+        let mutation_proposer = ReflectiveMutationProposer {
+            trainset: trainset.clone(),
+            adapter: adapter.clone(),
+            candidate_selector: Box::new(CurrentBestSelector),
+            component_selector: Box::new(AllComponentSelector),
+            batch_sampler: Box::new(EpochShuffledSampler::new(1, 0).expect("valid sampler")),
+            reflection_lm: Arc::new(MockLM),
+            reflection_prompt_template: None,
+            component_metadata: crate::core::component::ComponentMetaMap::new(),
+            perfect_score: None,
+            skip_perfect_score: false,
+        };
+        let merge_proposer = MergeProposer::new(valset.clone(), adapter.clone(), false, 0, 1, 0)
+            .expect("valid merge proposer");
+
+        let mut engine = GEPAEngine {
+            trainset,
+            valset,
+            adapter,
+            seed_candidate: seed,
+            mutation_proposer,
+            merge_proposer,
+            eval_policy: Box::new(FullEvalPolicy),
+            stop_condition: Box::new(MaxIterationsStopper::new(0)),
+            frontier_type: FrontierType::Instance,
+            callbacks: vec![],
+            rng_seed: None,
+            run_dir: Some(run_dir.to_string_lossy().into_owned()),
+            str_candidate_key: None,
+            track_best_outputs: true,
+            cache_evaluation: false,
+            tracker: Box::new(crate::tracking::NoopTracker),
+        };
+
+        let result = engine.run().await.expect("resume should skip evaluation");
+        assert_eq!(result.num_candidates(), 1);
+
+        std::fs::remove_dir_all(run_dir).expect("cleanup temp run dir");
+    }
+
+    #[tokio::test]
     async fn engine_empty_valset_returns_error() {
         let trainset: Arc<dyn DataLoader<usize, String>> =
             Arc::new(VecLoader::new(vec!["item".to_string()]));
@@ -891,6 +1162,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 0).expect("valid sampler")),
             reflection_lm: Arc::new(MockLM),
             reflection_prompt_template: None,
+            component_metadata: crate::core::component::ComponentMetaMap::new(),
             perfect_score: Some(1.0),
             skip_perfect_score: false,
         };
@@ -958,11 +1230,144 @@ mod tests {
             vec![0.3, 0.6, 0.9],
         );
 
-        let eval = build_valset_evaluation(&ids, &batch);
-        assert_eq!(eval.scores_by_val_id.get(&0), Some(&0.3));
-        assert_eq!(eval.scores_by_val_id.get(&1), Some(&0.6));
-        assert_eq!(eval.scores_by_val_id.get(&2), Some(&0.9));
-        assert!(eval.objective_scores_by_val_id.is_none());
+        let eval = build_valset_evaluation(&ids, &batch).expect("valid batch");
+        assert_eq!(eval.valset_evaluation.scores_by_val_id.get(&0), Some(&0.3));
+        assert_eq!(eval.valset_evaluation.scores_by_val_id.get(&1), Some(&0.6));
+        assert_eq!(eval.valset_evaluation.scores_by_val_id.get(&2), Some(&0.9));
+        assert_eq!(
+            eval.valset_evaluation.outputs_by_val_id.get(&0),
+            Some(&serde_json::json!("a"))
+        );
+        assert!(eval.valset_evaluation.objective_scores_by_val_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_valset_evaluation_rejects_length_mismatch() {
+        let ids = vec![0usize, 1, 2];
+        let batch: EvaluationBatch<(), String> = EvaluationBatch::new(vec!["a".into()], vec![0.3]);
+
+        let err = build_valset_evaluation(&ids, &batch).unwrap_err();
+        assert!(err.to_string().contains("batch of 3"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_valset_with_cache_only_evaluates_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAdapter(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl GEPAAdapter<String, (), String> for CountingAdapter {
+            async fn evaluate(
+                &self,
+                batch: &[String],
+                _candidate: &Candidate,
+                _capture_traces: bool,
+            ) -> Result<EvaluationBatch<(), String>> {
+                self.0.fetch_add(batch.len(), Ordering::SeqCst);
+                Ok(EvaluationBatch::new(batch.to_vec(), vec![0.5; batch.len()]))
+            }
+
+            async fn make_reflective_dataset(
+                &self,
+                _candidate: &Candidate,
+                _eval_batch: &EvaluationBatch<(), String>,
+                components: &[String],
+            ) -> Result<ReflectiveDataset> {
+                Ok(components.iter().map(|k| (k.clone(), vec![])).collect())
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let valset: Arc<dyn DataLoader<usize, String>> = Arc::new(VecLoader::new(vec![
+            "cached".into(),
+            "miss1".into(),
+            "miss2".into(),
+        ]));
+        let trainset: Arc<dyn DataLoader<usize, String>> =
+            Arc::new(VecLoader::new(vec!["train".into()]));
+        let adapter: Arc<dyn GEPAAdapter<String, (), String>> =
+            Arc::new(CountingAdapter(counter.clone()));
+
+        let mut candidate = Candidate::new();
+        candidate.insert("instructions".into(), "seed".into());
+        let seed_eval = ValsetEvaluation::from_vecs(
+            vec![0usize, 1, 2],
+            vec![
+                serde_json::json!("seed0"),
+                serde_json::json!("seed1"),
+                serde_json::json!("seed2"),
+            ],
+            vec![0.1, 0.1, 0.1],
+            None,
+        );
+        let mut cache = EvaluationCache::new();
+        cache.put(
+            &candidate,
+            &0usize,
+            serde_json::json!("cached-output"),
+            0.9,
+            None,
+        );
+        let mut state = GEPAState::new(
+            candidate.clone(),
+            seed_eval,
+            FrontierType::Instance,
+            Some(cache),
+        )
+        .expect("state should construct");
+
+        let engine = GEPAEngine {
+            trainset: trainset.clone(),
+            valset,
+            adapter: adapter.clone(),
+            seed_candidate: candidate.clone(),
+            mutation_proposer: ReflectiveMutationProposer {
+                trainset,
+                adapter: adapter.clone(),
+                candidate_selector: Box::new(CurrentBestSelector),
+                component_selector: Box::new(AllComponentSelector),
+                batch_sampler: Box::new(EpochShuffledSampler::new(1, 0).expect("valid sampler")),
+                reflection_lm: Arc::new(MockLM),
+                reflection_prompt_template: None,
+                component_metadata: crate::core::component::ComponentMetaMap::new(),
+                perfect_score: None,
+                skip_perfect_score: false,
+            },
+            merge_proposer: MergeProposer::new(
+                Arc::new(VecLoader::new(vec!["cached".to_string()])),
+                adapter,
+                false,
+                0,
+                1,
+                0,
+            )
+            .expect("valid merge proposer"),
+            eval_policy: Box::new(FullEvalPolicy),
+            stop_condition: Box::new(MaxIterationsStopper::new(0)),
+            frontier_type: FrontierType::Instance,
+            callbacks: vec![],
+            rng_seed: None,
+            run_dir: None,
+            str_candidate_key: None,
+            track_best_outputs: false,
+            cache_evaluation: true,
+            tracker: Box::new(crate::tracking::NoopTracker),
+        };
+
+        let outcome = engine
+            .evaluate_valset_with_cache(&mut state, &candidate, &[0, 1, 2])
+            .await
+            .expect("cache-backed evaluation should succeed");
+
+        assert_eq!(outcome.metric_evals, 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.scores, vec![0.9, 0.5, 0.5]);
+        assert_eq!(outcome.outputs[0], serde_json::json!("cached-output"));
+        assert_eq!(
+            state.evaluation_cache.as_ref().map(EvaluationCache::len),
+            Some(3)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1033,6 +1438,7 @@ mod tests {
             batch_sampler: Box::new(EpochShuffledSampler::new(2, 42).expect("valid sampler")),
             reflection_lm: Arc::new(MockLM),
             reflection_prompt_template: None,
+            component_metadata: crate::core::component::ComponentMetaMap::new(),
             perfect_score: None,
             skip_perfect_score: false,
         };
@@ -1141,14 +1547,14 @@ mod tests {
             EvaluationBatch::new(vec!["a".into(), "b".into()], vec![0.8, 0.6])
                 .with_objective_scores(obj_scores);
 
-        let eval = build_valset_evaluation(&ids, &batch);
+        let eval = build_valset_evaluation(&ids, &batch).expect("valid batch");
 
         assert!(
-            eval.objective_scores_by_val_id.is_some(),
+            eval.valset_evaluation.objective_scores_by_val_id.is_some(),
             "objective_scores_by_val_id should be Some when batch contains objective_scores"
         );
 
-        let obj_by_id = eval.objective_scores_by_val_id.unwrap();
+        let obj_by_id = eval.valset_evaluation.objective_scores_by_val_id.unwrap();
         assert_eq!(obj_by_id.len(), 2, "should have one entry per val_id");
 
         let precision_0 = obj_by_id

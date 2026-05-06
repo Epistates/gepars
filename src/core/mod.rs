@@ -5,6 +5,7 @@
 /// paths directly.
 pub mod adapter;
 pub mod callbacks;
+pub mod component;
 pub mod data_loader;
 pub mod engine;
 pub mod result;
@@ -17,6 +18,9 @@ pub mod state;
 
 // Adapter
 pub use adapter::{Candidate, EvaluationBatch, GEPAAdapter, ReflectiveDataset};
+
+// Component metadata
+pub use component::{ComponentKind, ComponentMeta, ComponentMetaMap, component_kind};
 
 // DataLoader
 pub use data_loader::{DataId, DataLoader, MutableDataLoader, VecLoader, ensure_loader};

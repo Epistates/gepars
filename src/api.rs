@@ -18,10 +18,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tracing::info;
 
 use crate::core::adapter::{Candidate, GEPAAdapter};
 use crate::core::callbacks::GEPACallback;
+use crate::core::component::ComponentMetaMap;
 use crate::core::data_loader::{DataId, DataLoader};
 use crate::core::engine::GEPAEngine;
 use crate::core::result::GEPAResult;
@@ -79,7 +81,7 @@ pub enum ComponentSelectorKind {
 /// to fire stops the engine.
 #[derive(Debug, Clone)]
 pub struct StopConditionConfig {
-    /// Maximum number of adapter `evaluate()` calls.  `None` = unlimited.
+    /// Maximum number of per-example metric evaluations.  `None` = unlimited.
     pub max_metric_calls: Option<usize>,
     /// Maximum number of optimisation iterations.  `None` = unlimited.
     pub max_iterations: Option<usize>,
@@ -157,7 +159,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     // ---- Required -----------------------------------------------------------
     /// The starting candidate to optimise.
@@ -207,6 +209,8 @@ where
     /// built-in Appendix C template.
     pub reflection_prompt_template:
         Option<crate::proposer::reflective_mutation::PromptTemplateConfig>,
+    /// Optional metadata for component-aware mutation prompts.
+    pub component_metadata: ComponentMetaMap,
     /// Callbacks for observing the optimisation run.
     pub callbacks: Vec<Box<dyn GEPACallback<Id>>>,
     /// RNG seed (stored in result metadata).
@@ -227,7 +231,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     /// Construct a config with the four required parameters and sensible defaults.
     pub fn new(
@@ -255,6 +259,7 @@ where
             perfect_score: Some(1.0),
             skip_perfect_score: true,
             reflection_prompt_template: None,
+            component_metadata: ComponentMetaMap::new(),
             callbacks: vec![],
             rng_seed: None,
             run_dir: None,
@@ -284,7 +289,7 @@ where
     Id: DataId,
     Item: Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
-    RO: Send + Sync + 'static,
+    RO: Send + Sync + Serialize + 'static,
 {
     // ── Build the language model client ──────────────────────────────────────
     let lm_cfg = &config.lm_config;
@@ -338,6 +343,7 @@ where
         batch_sampler,
         reflection_lm: lm.clone(),
         reflection_prompt_template: config.reflection_prompt_template.clone(),
+        component_metadata: config.component_metadata.clone(),
         perfect_score: config.perfect_score,
         skip_perfect_score: config.skip_perfect_score,
     };

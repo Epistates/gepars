@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// `GEPAState` and returns `true` when the engine should stop iterating.
 ///
 /// The included concrete implementations cover the most common scenarios:
-/// - [`MaxMetricCallsStopper`]   — stop after a fixed number of `evaluate()` calls.
+/// - [`MaxMetricCallsStopper`]   — stop after a fixed number of per-example metric evaluations.
 /// - [`TimeoutStopper`]          — stop after a wall-clock duration.
 /// - [`CompositeStopper`]        — combine any/all predicates.
 /// - [`FileStopper`]             — stop when a sentinel file appears on disk.
@@ -38,13 +38,14 @@ pub trait StopCondition<Id: DataId>: Send + Sync {
 // MaxMetricCallsStopper
 // ---------------------------------------------------------------------------
 
-/// Stop after a fixed total number of adapter `evaluate()` calls.
+/// Stop after a fixed total number of per-example metric evaluations.
 ///
 /// The check uses `state.total_num_evals` which the engine increments after
-/// every evaluation.
+/// every example actually evaluated by the adapter. Cached examples do not
+/// consume this budget.
 #[derive(Debug, Clone, Copy)]
 pub struct MaxMetricCallsStopper {
-    /// Maximum number of adapter `evaluate()` calls allowed.
+    /// Maximum number of per-example metric evaluations allowed.
     pub max_calls: usize,
 }
 

@@ -14,6 +14,7 @@
 ///                    evaluation policy, instruction proposal.
 /// - [`utils`]      — stop conditions.
 /// - [`api`]        — high-level `optimize()` function.
+pub mod adapters;
 pub mod api;
 pub mod core;
 pub mod error;
@@ -35,6 +36,7 @@ pub use core::callbacks::{
     CandidateAcceptedEvent, CandidateRejectedEvent, CompositeCallback, GEPACallback,
     OptimizationEndEvent, OptimizationStartEvent, notify_callbacks,
 };
+pub use core::component::{ComponentKind, ComponentMeta, ComponentMetaMap, component_kind};
 pub use core::data_loader::{DataId, DataLoader, MutableDataLoader, VecLoader, ensure_loader};
 pub use core::engine::GEPAEngine;
 pub use core::result::GEPAResult;
@@ -72,7 +74,8 @@ pub use strategies::component_selector::{
 };
 pub use strategies::eval_policy::{EvalPolicy, FullEvalPolicy};
 pub use strategies::instruction_proposal::{
-    META_PROMPT_TEMPLATE, extract_output, format_samples_as_markdown, render_prompt,
+    CODE_META_PROMPT_TEMPLATE, CONFIG_META_PROMPT_TEMPLATE, META_PROMPT_TEMPLATE, extract_output,
+    format_samples_as_markdown, render_code_prompt, render_config_prompt, render_prompt,
 };
 
 // API

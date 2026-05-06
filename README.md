@@ -33,7 +33,6 @@ async-trait = "0.1"
 Implement `GEPAAdapter` for your task, then call `optimize`:
 
 ```rust
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -105,7 +104,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Example { question: "4+4".into(), answer: "8".into() },
     ];
 
-    let mut seed = HashMap::new();
+    let mut seed = Candidate::new();
     seed.insert("instructions".into(), "Answer the following question:".into());
 
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
@@ -207,7 +206,7 @@ option as a public field with sensible defaults.
 
 | Field | Type | Description |
 |---|---|---|
-| `seed_candidate` | `HashMap<String, String>` | Starting prompt(s) by component name |
+| `seed_candidate` | `Candidate` | Starting component text by component name |
 | `trainset` | `Arc<dyn DataLoader<Id, Item>>` | Training split |
 | `valset` | `Arc<dyn DataLoader<Id, Item>>` | Validation split (Pareto tracking) |
 | `adapter` | `Arc<dyn GEPAAdapter<Item, T, RO>>` | Your evaluation logic |
@@ -217,7 +216,7 @@ option as a public field with sensible defaults.
 
 | Field | Default | Description |
 |---|---|---|
-| `max_metric_calls` | `Some(500)` | Budget in adapter `evaluate()` calls |
+| `max_metric_calls` | `Some(500)` | Budget in per-example metric evaluations; cached examples do not consume it |
 | `max_iterations` | `None` | Hard iteration cap |
 | `timeout` | `None` | Wall-clock limit (`std::time::Duration`) |
 
@@ -229,10 +228,11 @@ All active conditions are combined with `OR` — the first to fire stops the run
 |---|---|---|
 | `candidate_selector` | `CandidateSelectorKind::Pareto` | How to pick a base candidate |
 | `component_selector` | `ComponentSelectorKind::RoundRobin` | Which prompt components to mutate |
-| `minibatch_size` | `16` | Training examples per iteration |
+| `minibatch_size` | `3` | Training examples per iteration |
 | `frontier_type` | `FrontierType::Instance` | Pareto tracking strategy |
-| `use_merge` | `true` | Enable system-aware merge |
-| `max_merge_invocations` | `20` | Merge budget across the run |
+| `use_merge` | `false` | Enable system-aware merge |
+| `max_merge_invocations` | `5` | Merge budget across the run |
+| `component_metadata` | `{}` | Optional text/code/config metadata for component-aware reflection prompts |
 
 ### LM settings (`LMConfig`)
 
@@ -272,6 +272,21 @@ cargo run --example custom_adapter
 
 # Live API (requires OPENAI_API_KEY)
 OPENAI_API_KEY=sk-... cargo run --example quickstart -- --live
+```
+
+## Testing
+
+```bash
+cargo test
+cargo clippy -- -D warnings
+```
+
+The optional hermetic e2e test exercises the public `optimize()` API, the
+OpenAI-compatible HTTP LM path, mutation acceptance, callbacks, cache-backed
+state, and run-directory persistence:
+
+```bash
+cargo test --test e2e -- --ignored
 ```
 
 ## References
